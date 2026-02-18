@@ -1,0 +1,21 @@
+// OpenAthan Waybar Configuration
+// Add this to your ~/.config/waybar/config.jsonc
+
+// 1. Add this module definition:
+"custom/openathan": {
+    "exec": "~/.local/bin/openathan",
+    "interval": 60,
+    "return-type": "json",
+    "tooltip": true,
+    "format": "{}"
+},
+
+// 2. Add "custom/openathan" to your modules array:
+//    For example, if you want it in modules-right:
+//
+//    "modules-right": [
+//        "custom/openathan",  // <-- Add here
+//        "tray",
+//        "bluetooth",
+//        ...
+//    ]
