@@ -86,6 +86,7 @@ BarWidget {
       Text {
         anchors.verticalCenter: parent.verticalCenter
         text: panelLoader.item ? panelLoader.item.barLabel : "Prayer …"
+        textFormat: Text.PlainText
         color: button.foreground
         font.family: button.fontFamily
         font.pixelSize: button.fontSize

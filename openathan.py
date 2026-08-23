@@ -29,6 +29,16 @@ NOTIFICATION_STATE = STATE_DIR / "notifications.json"
 THEMED_ICON = CACHE_DIR / "openathan.svg"
 THEME_PATH = Path.home() / ".local/state/omarchy/current/theme/colors.toml"
 
+HTTP_MAX_BYTES = 256 * 1024
+CACHE_MAX_BYTES = 128 * 1024
+THEME_MAX_BYTES = 64 * 1024
+SVG_MAX_BYTES = 64 * 1024
+READ_CHUNK_BYTES = 16 * 1024
+JSON_MAX_DEPTH = 8
+JSON_MAX_ITEMS = 512
+JSON_MAX_CONTAINER_ITEMS = 64
+JSON_MAX_STRING_LENGTH = 512
+
 METHODS = {
     "Jafari": 0,
     "MWL": 1,
@@ -100,11 +110,59 @@ def ensure_dirs() -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def read_limited(stream: Any, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = stream.read(min(READ_CHUNK_BYTES, max_bytes - total + 1))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > max_bytes:
+            raise OpenAthanError("Input exceeded the allowed size.")
+        chunks.append(chunk)
+
+
+def read_text_limited(path: Path, max_bytes: int) -> str:
+    with path.open("rb") as stream:
+        return read_limited(stream, max_bytes).decode("utf-8")
+
+
+def validate_json_shape(value: Any) -> None:
+    item_count = 0
+
+    def visit(item: Any, depth: int) -> None:
+        nonlocal item_count
+        item_count += 1
+        if item_count > JSON_MAX_ITEMS or depth > JSON_MAX_DEPTH:
+            raise OpenAthanError("JSON data exceeded the allowed complexity.")
+        if isinstance(item, str):
+            if len(item) > JSON_MAX_STRING_LENGTH:
+                raise OpenAthanError("JSON data contained an oversized string.")
+        elif isinstance(item, dict):
+            if len(item) > JSON_MAX_CONTAINER_ITEMS:
+                raise OpenAthanError("JSON data contained too many fields.")
+            for key, child in item.items():
+                if not isinstance(key, str) or len(key) > 64:
+                    raise OpenAthanError("JSON data contained an invalid field name.")
+                visit(child, depth + 1)
+        elif isinstance(item, list):
+            if len(item) > JSON_MAX_CONTAINER_ITEMS:
+                raise OpenAthanError("JSON data contained too many entries.")
+            for child in item:
+                visit(child, depth + 1)
+        elif item is not None and not isinstance(item, (bool, int, float)):
+            raise OpenAthanError("JSON data contained an unsupported value.")
+
+    visit(value, 0)
+
+
 def read_json(path: Path) -> dict[str, Any] | None:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(read_text_limited(path, CACHE_MAX_BYTES))
+        validate_json_shape(value)
         return value if isinstance(value, dict) else None
-    except (OSError, ValueError):
+    except (OSError, UnicodeError, ValueError, OpenAthanError):
         return None
 
 
@@ -130,28 +188,58 @@ def request_json(url: str, timeout: float = 8) -> dict[str, Any]:
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError, urllib.error.URLError) as error:
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and int(content_length) > HTTP_MAX_BYTES:
+                raise OpenAthanError("The remote service returned too much data.")
+            payload = json.loads(read_limited(response, HTTP_MAX_BYTES).decode("utf-8"))
+            validate_json_shape(payload)
+    except OpenAthanError:
+        raise
+    except (OSError, UnicodeError, ValueError, urllib.error.URLError) as error:
         raise OpenAthanError(f"Network request failed: {error}") from error
     if not isinstance(payload, dict):
         raise OpenAthanError("The location or prayer service returned invalid data.")
     return payload
 
 
+def provider_text(
+    value: Any, field: str, max_length: int, *, required: bool = False
+) -> str:
+    if value is None or value == "":
+        if required:
+            raise OpenAthanError(f"The remote service did not include {field}.")
+        return ""
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        raise OpenAthanError(f"The remote service returned an invalid {field}.")
+    text = str(value).strip()
+    if len(text) > max_length or (required and not text):
+        raise OpenAthanError(f"The remote service returned an invalid {field}.")
+    return text
+
+
 def normalize_location(raw: dict[str, Any], source: str) -> dict[str, Any]:
-    city = str(raw.get("city") or raw.get("name") or "").strip()
-    country = str(raw.get("country") or raw.get("country_name") or "").strip()
-    country_code = str(raw.get("country_code") or raw.get("countryCode") or "").upper().strip()
+    if not isinstance(raw, dict):
+        raise OpenAthanError("The location service returned invalid data.")
+    city = provider_text(raw.get("city") or raw.get("name"), "city", 128, required=True)
+    country = provider_text(raw.get("country") or raw.get("country_name"), "country", 128)
+    country_code = provider_text(
+        raw.get("country_code") or raw.get("countryCode"), "country code", 2
+    ).upper()
     latitude = raw.get("latitude") if raw.get("latitude") is not None else raw.get("lat")
     longitude = raw.get("longitude") if raw.get("longitude") is not None else raw.get("lon")
-    timezone = str(raw.get("timezone") or "").strip()
+    raw_timezone = raw.get("timezone")
+    if isinstance(raw_timezone, dict):
+        raw_timezone = raw_timezone.get("id")
+    timezone = provider_text(raw_timezone, "timezone", 64)
     try:
+        if isinstance(latitude, bool) or isinstance(longitude, bool):
+            raise ValueError
         latitude = float(latitude)
         longitude = float(longitude)
     except (TypeError, ValueError) as error:
         raise OpenAthanError("The detected location did not include usable coordinates.") from error
-    if not city:
-        raise OpenAthanError("The detected location did not include a city.")
+    if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+        raise OpenAthanError("The detected location included invalid coordinates.")
     return {
         "city": city,
         "country": country,
@@ -202,8 +290,10 @@ def geocode_location(city: str, country: str) -> dict[str, Any]:
     params = urllib.parse.urlencode({"name": query, "count": 8, "language": "en", "format": "json"})
     payload = request_json(f"https://geocoding-api.open-meteo.com/v1/search?{params}")
     results = payload.get("results")
-    if not isinstance(results, list) or not results:
+    if not isinstance(results, list) or not results or len(results) > 8:
         raise OpenAthanError(f"No location was found for {query}.")
+    if not all(isinstance(result, dict) for result in results):
+        raise OpenAthanError("The location service returned invalid results.")
 
     wanted = country.strip().lower()
     selected = results[0]
@@ -273,10 +363,14 @@ def location_key(location: dict[str, Any]) -> str:
 
 
 def parse_api_time(value: Any) -> str:
-    match = re.search(r"\b(\d{1,2}):(\d{2})\b", str(value or ""))
+    raw = provider_text(value, "prayer time", 32, required=True)
+    match = re.search(r"\b(\d{1,2}):(\d{2})\b", raw)
     if not match:
         raise OpenAthanError("The prayer service returned an invalid time.")
-    return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise OpenAthanError("The prayer service returned an invalid time.")
+    return f"{hour:02d}:{minute:02d}"
 
 
 def fetch_timings(
@@ -295,18 +389,25 @@ def fetch_timings(
     if payload.get("code") != 200 or not isinstance(payload.get("data"), dict):
         raise OpenAthanError("The prayer service could not calculate times for this location.")
     data = payload["data"]
-    raw_timings = data.get("timings", {})
+    raw_timings = data.get("timings")
+    if not isinstance(raw_timings, dict):
+        raise OpenAthanError("The prayer service returned invalid timings.")
     timings = {key: parse_api_time(raw_timings.get(api_key)) for key, _, api_key in PRAYERS}
-    hijri = data.get("date", {}).get("hijri", {})
+    date_data = data.get("date")
+    hijri = date_data.get("hijri", {}) if isinstance(date_data, dict) else {}
     month = hijri.get("month", {}) if isinstance(hijri, dict) else {}
-    timezone_name = str(data.get("meta", {}).get("timezone") or location.get("timezone") or "")
+    meta = data.get("meta")
+    timezone_value = meta.get("timezone") if isinstance(meta, dict) else None
+    timezone_name = provider_text(
+        timezone_value or location.get("timezone"), "timezone", 64
+    )
     return {
         "date": day.isoformat(),
         "timings": timings,
         "hijri": {
-            "day": str(hijri.get("day") or ""),
-            "month": str(month.get("en") or ""),
-            "year": str(hijri.get("year") or ""),
+            "day": provider_text(hijri.get("day"), "Hijri day", 2),
+            "month": provider_text(month.get("en"), "Hijri month", 32),
+            "year": provider_text(hijri.get("year"), "Hijri year", 4),
         },
         "timezone": timezone_name,
         "fetchedAt": datetime.now().astimezone().isoformat(),
@@ -418,8 +519,8 @@ def build_schedule(timings: dict[str, Any], now: datetime) -> tuple[list[dict[st
 
 def theme_color() -> str:
     try:
-        colors = THEME_PATH.read_text(encoding="utf-8")
-    except OSError:
+        colors = read_text_limited(THEME_PATH, THEME_MAX_BYTES)
+    except (OSError, UnicodeError, OpenAthanError):
         return "#c9c7cd"
     for key in ("accent", "foreground", "color7"):
         match = re.search(rf"^\s*{key}\s*=\s*[\"']?(#[0-9a-fA-F]{{6}})", colors, re.MULTILINE)
@@ -430,12 +531,15 @@ def theme_color() -> str:
 
 def render_themed_icon() -> Path:
     ensure_dirs()
-    source = (PLUGIN_DIR / "assets/openathan.svg").read_text(encoding="utf-8")
+    try:
+        source = read_text_limited(PLUGIN_DIR / "assets/openathan.svg", SVG_MAX_BYTES)
+    except (OSError, UnicodeError, OpenAthanError) as error:
+        raise OpenAthanError("The OpenAthan icon could not be read safely.") from error
     rendered = source.replace("currentColor", theme_color())
     try:
-        if THEMED_ICON.read_text(encoding="utf-8") == rendered:
+        if read_text_limited(THEMED_ICON, SVG_MAX_BYTES) == rendered:
             return THEMED_ICON
-    except OSError:
+    except (OSError, UnicodeError, OpenAthanError):
         pass
     THEMED_ICON.write_text(rendered, encoding="utf-8")
     return THEMED_ICON

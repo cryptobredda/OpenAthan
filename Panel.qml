@@ -168,6 +168,7 @@ Panel {
               Text {
                 width: parent.width
                 text: root.nextPrayer ? root.nextPrayer.name : (root.loading ? "Finding prayer times" : "Prayer times unavailable")
+                textFormat: Text.PlainText
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.heading
@@ -178,6 +179,7 @@ Panel {
               Text {
                 width: parent.width
                 text: root.nextPrayer ? (root.nextPrayer.dayLabel + " · " + root.nextPrayer.countdown) : ""
+                textFormat: Text.PlainText
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -191,6 +193,7 @@ Panel {
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               text: root.nextPrayer ? root.nextPrayer.time : "—"
+              textFormat: Text.PlainText
               color: root.accent
               font.family: root.fontFamily
               font.pixelSize: Style.font.heading
@@ -218,6 +221,7 @@ Panel {
               anchors.rightMargin: Style.space(10)
               anchors.verticalCenter: parent.verticalCenter
               text: root.report ? "󰍎  " + root.report.location.label : ""
+              textFormat: Text.PlainText
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -230,6 +234,7 @@ Panel {
               anchors.rightMargin: Style.space(10)
               anchors.verticalCenter: parent.verticalCenter
               text: root.report ? root.report.hijri : ""
+              textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -270,6 +275,7 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                   width: Style.space(100)
                   text: parent.modelData.name
+                  textFormat: Text.PlainText
                   color: parent.modelData.key === "sunrise" ? root.dim : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -280,6 +286,7 @@ Panel {
                   anchors.horizontalCenter: parent.horizontalCenter
                   anchors.verticalCenter: parent.verticalCenter
                   text: parent.modelData.time
+                  textFormat: Text.PlainText
                   color: parent.modelData.status === "next" ? root.accent : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -293,6 +300,7 @@ Panel {
                   width: Style.space(116)
                   horizontalAlignment: Text.AlignRight
                   text: parent.modelData.relative
+                  textFormat: Text.PlainText
                   color: parent.modelData.status === "next" ? root.foreground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -308,6 +316,7 @@ Panel {
             topPadding: Style.space(18)
             bottomPadding: Style.space(18)
             text: root.errorText
+            textFormat: Text.PlainText
             color: Color.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -327,6 +336,7 @@ Panel {
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
               text: root.report ? root.report.method.label + " · " + root.report.school : ""
+              textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -341,6 +351,7 @@ Panel {
                   ? "CACHED DATA"
                   : (root.report.location.source === "auto" ? "AUTO LOCATION" : "MANUAL LOCATION"))
                 : ""
+              textFormat: Text.PlainText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

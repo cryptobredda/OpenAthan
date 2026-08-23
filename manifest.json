@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "bredda.openathan",
   "name": "OpenAthan",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "author": "bredda",
   "license": "MIT",
   "description": "Location-aware Islamic prayer times and notifications for the Omarchy bar.",

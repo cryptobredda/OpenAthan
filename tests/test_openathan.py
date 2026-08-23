@@ -1,7 +1,11 @@
 import importlib.util
+import io
+import json
+import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 
@@ -12,6 +16,54 @@ SPEC.loader.exec_module(openathan)
 
 
 class OpenAthanTests(unittest.TestCase):
+    def test_limited_reader_rejects_oversized_input(self):
+        with self.assertRaises(openathan.OpenAthanError):
+            openathan.read_limited(io.BytesIO(b"12345"), 4)
+
+    def test_json_cache_rejects_oversized_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.json"
+            path.write_bytes(b" " * (openathan.CACHE_MAX_BYTES + 1))
+            self.assertIsNone(openathan.read_json(path))
+
+    def test_json_shape_rejects_excessive_entries(self):
+        value = list(range(openathan.JSON_MAX_CONTAINER_ITEMS + 1))
+        with self.assertRaises(openathan.OpenAthanError):
+            openathan.validate_json_shape(value)
+
+    def test_request_json_streams_with_a_byte_limit(self):
+        class Response(io.BytesIO):
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        response = Response(json.dumps({"city": "Bristol"}).encode())
+        with mock.patch.object(openathan.urllib.request, "urlopen", return_value=response):
+            self.assertEqual(openathan.request_json("https://example.test")["city"], "Bristol")
+
+    def test_location_fields_and_coordinates_are_bounded(self):
+        base = {
+            "city": "Bristol",
+            "country": "United Kingdom",
+            "country_code": "GB",
+            "latitude": 51.45,
+            "longitude": -2.58,
+            "timezone": "Europe/London",
+        }
+        self.assertEqual(openathan.normalize_location(base, "auto")["city"], "Bristol")
+        with self.assertRaises(openathan.OpenAthanError):
+            openathan.normalize_location({**base, "city": "x" * 129}, "auto")
+        with self.assertRaises(openathan.OpenAthanError):
+            openathan.normalize_location({**base, "latitude": 91}, "auto")
+
+    def test_prayer_time_range_is_validated(self):
+        with self.assertRaises(openathan.OpenAthanError):
+            openathan.parse_api_time("25:00")
+
     def test_country_method_recommendations(self):
         self.assertEqual(openathan.recommended_method("GB"), "Moonsighting")
         self.assertEqual(openathan.recommended_method("SA"), "Makkah")
