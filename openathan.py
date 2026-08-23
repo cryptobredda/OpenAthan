@@ -1,738 +1,547 @@
 #!/usr/bin/env python3
-"""
-OpenAthan - Islamic Prayer Times for Waybar
-A CLI tool that outputs JSON for Waybar custom module
-Uses Aladhan API for accurate prayer times
-"""
+"""Fetch and format location-aware prayer data for the OpenAthan QML plugin."""
 
-import json
-import sys
-import os
+from __future__ import annotations
+
 import argparse
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+import hashlib
+import json
+import os
+import re
 import subprocess
-import urllib.request
+import sys
+import tempfile
 import urllib.error
-import time
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-# =============================================================================
-# Configuration
-# =============================================================================
 
-CONFIG_DIR = Path.home() / ".config" / "openAthan"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-LOCATION_FILE = CONFIG_DIR / "location.json"
-STATE_FILE = CONFIG_DIR / "state.json"
-TIMINGS_CACHE_FILE = CONFIG_DIR / "timings_cache.json"
-SOUND_FILE = CONFIG_DIR / "athan.wav"
+PLUGIN_DIR = Path(__file__).resolve().parent
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "openathan"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "openathan"
+LOCATION_CACHE = STATE_DIR / "location.json"
+TIMINGS_CACHE = CACHE_DIR / "timings.json"
+NOTIFICATION_STATE = STATE_DIR / "notifications.json"
+THEMED_ICON = CACHE_DIR / "openathan.svg"
+THEME_PATH = Path.home() / ".local/state/omarchy/current/theme/colors.toml"
 
-# Aladhan API calculation methods
-# See: https://aladhan.com/calculation-methods
-ALADHAN_METHODS = {
-    "MWL": 1,                 # Muslim World League
-    "ISNA": 2,                # Islamic Society of North America
-    "Egypt": 3,                # Egyptian General Authority of Survey
-    "Makkah": 4,              # Umm Al-Qura University, Makkah
-    "Karachi": 5,              # University of Islamic Sciences, Karachi
-    "Tehran": 7,              # Institute of Geophysics, University of Tehran
-    "Gulf": 8,                # Gulf Region
-    "Kuwait": 9,              # Kuwait
-    "Qatar": 10,               # Qatar
-    "Singapore": 11,            # Majlis Ugama Islam Singapura, Singapore
-    "France": 12,              # Union Organization islamic de France
-    "Turkey": 13,              # Diyanet Isleri Baskanligi, Turkey
-    "Russia": 14,              # Spiritual Administration of Muslims of Russia
-    "Moonsighting": 15,         # Moonsighting Committee Worldwide
-    "Dubai": 16,              # Dubai (custom research)
-    "JAKIM": 17,             # Jabatan Kemajuan Islam Malaysia (JAKIM)
-    "Tunisia": 18,            # Tunisia
-    "Algeria": 19,            # Algeria
-    "Kemenag": 20,             # Kementerian Agama Republik Indonesia
-    "Morocco": 21,             # Morocco
-    "Portugal": 22,            # Comunidade Islamica de Lisboa (Portugal)
-    "Jafari": 0,               # Shia Ithna-Ashari (Jafari)
+METHODS = {
+    "Jafari": 0,
+    "MWL": 1,
+    "ISNA": 2,
+    "Egypt": 3,
+    "Makkah": 4,
+    "Karachi": 5,
+    "Tehran": 7,
+    "Gulf": 8,
+    "Kuwait": 9,
+    "Qatar": 10,
+    "Singapore": 11,
+    "France": 12,
+    "Turkey": 13,
+    "Russia": 14,
+    "Moonsighting": 15,
+    "Dubai": 16,
+    "JAKIM": 17,
+    "Tunisia": 18,
+    "Algeria": 19,
+    "Kemenag": 20,
+    "Morocco": 21,
+    "Portugal": 22,
 }
 
-# Asr methods for Aladhan API
-ALADHAN_ASR_METHODS = {
-    "Shafi": 0,    # Shafi (standard)
-    "Hanafi": 1,   # Hanafi (double shadow length)
+# A conservative country recommendation. Users can override it in plugin settings.
+COUNTRY_METHODS = {
+    "AE": "Dubai",
+    "BD": "Karachi",
+    "CA": "ISNA",
+    "DZ": "Algeria",
+    "EG": "Egypt",
+    "FR": "France",
+    "GB": "Moonsighting",
+    "ID": "Kemenag",
+    "IN": "Karachi",
+    "IR": "Tehran",
+    "KW": "Kuwait",
+    "MA": "Morocco",
+    "MY": "JAKIM",
+    "PK": "Karachi",
+    "PT": "Portugal",
+    "QA": "Qatar",
+    "RU": "Russia",
+    "SA": "Makkah",
+    "SG": "Singapore",
+    "TN": "Tunisia",
+    "TR": "Turkey",
+    "US": "ISNA",
 }
 
-# Default configuration
-DEFAULT_CONFIG = {
-    "calculation_method": "MWL",
-    "asr_method": "Shafi",
-    "adjustments": {  # Manual time adjustments in minutes
-        "fajr": 0,
-        "dhuhr": 0,
-        "asr": 0,
-        "maghrib": 0,
-        "isha": 0
-    },
-    "notifications_enabled": True,
-    "sound_enabled": True,
-    "notification_sound": str(SOUND_FILE),
-    "show_hijri_date": True,
-    "language": "en"  # en or ar
-}
+PRAYERS = (
+    ("fajr", "Fajr", "Fajr"),
+    ("sunrise", "Sunrise", "Sunrise"),
+    ("dhuhr", "Dhuhr", "Dhuhr"),
+    ("asr", "Asr", "Asr"),
+    ("maghrib", "Maghrib", "Maghrib"),
+    ("isha", "Isha", "Isha"),
+)
+PRAYER_KEYS = {"fajr", "dhuhr", "asr", "maghrib", "isha"}
 
-# =============================================================================
-# Prayer Names
-# =============================================================================
 
-PRAYER_NAMES = {
-    "en": {
-        "fajr": "Fajr",
-        "dhuhr": "Dhuhr",
-        "asr": "Asr",
-        "maghrib": "Maghrib",
-        "isha": "Isha",
-        "sunrise": "Sunrise"
-    },
-    "ar": {
-        "fajr": "الفجر",
-        "dhuhr": "الظهر",
-        "asr": "العصر",
-        "maghrib": "المغرب",
-        "isha": "العشاء",
-        "sunrise": "الشروق"
-    }
-}
+class OpenAthanError(RuntimeError):
+    """An expected error suitable for showing in the plugin."""
 
-# =============================================================================
-# Aladhan API Functions
-# =============================================================================
 
-def fetch_prayer_times_from_api(city, country, method, asr_method):
-    """Fetch prayer times from Aladhan API."""
-    # Map method names to API method numbers
-    method_id = ALADHAN_METHODS.get(method, 1)
-    asr_id = ALADHAN_ASR_METHODS.get(asr_method, 0)
+def ensure_dirs() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Build API URL - use city and country
-    url = f"https://api.aladhan.com/v1/timingsByCity"
-    params = {
+
+def read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=True, indent=2)
+            stream.write("\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def request_json(url: str, timeout: float = 8) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "OpenAthan/2.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        raise OpenAthanError(f"Network request failed: {error}") from error
+    if not isinstance(payload, dict):
+        raise OpenAthanError("The location or prayer service returned invalid data.")
+    return payload
+
+
+def normalize_location(raw: dict[str, Any], source: str) -> dict[str, Any]:
+    city = str(raw.get("city") or raw.get("name") or "").strip()
+    country = str(raw.get("country") or raw.get("country_name") or "").strip()
+    country_code = str(raw.get("country_code") or raw.get("countryCode") or "").upper().strip()
+    latitude = raw.get("latitude") if raw.get("latitude") is not None else raw.get("lat")
+    longitude = raw.get("longitude") if raw.get("longitude") is not None else raw.get("lon")
+    timezone = str(raw.get("timezone") or "").strip()
+    try:
+        latitude = float(latitude)
+        longitude = float(longitude)
+    except (TypeError, ValueError) as error:
+        raise OpenAthanError("The detected location did not include usable coordinates.") from error
+    if not city:
+        raise OpenAthanError("The detected location did not include a city.")
+    return {
         "city": city,
         "country": country,
-        "method": method_id,
-        "school": asr_id,  # Asr school (0=Shafi, 1=Hanafi)
+        "countryCode": country_code,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timezone": timezone,
+        "source": source,
+        "cachedAt": datetime.now().astimezone().isoformat(),
     }
 
-    # Add query string
-    query_string = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
-    full_url = f"{url}?{query_string}"
+
+def location_cache_fresh(location: dict[str, Any], max_age: timedelta = timedelta(hours=6)) -> bool:
+    try:
+        cached_at = datetime.fromisoformat(str(location["cachedAt"]))
+        if cached_at.tzinfo is None:
+            cached_at = cached_at.astimezone()
+        effective_age = timedelta(minutes=10) if location.get("stale", False) else max_age
+        return datetime.now().astimezone() - cached_at < effective_age
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def detect_location() -> dict[str, Any]:
+    providers = (
+        (
+            "https://ipwho.is/",
+            lambda value: value if value.get("success", True) else {},
+        ),
+        (
+            "https://ipapi.co/json/",
+            lambda value: value,
+        ),
+    )
+    errors: list[str] = []
+    for url, parser in providers:
+        try:
+            return normalize_location(parser(request_json(url, timeout=5)), "auto")
+        except OpenAthanError as error:
+            errors.append(str(error))
+    raise OpenAthanError("Automatic city detection failed. Set a manual city in the plugin settings.")
+
+
+def geocode_location(city: str, country: str) -> dict[str, Any]:
+    query = ", ".join(part for part in (city.strip(), country.strip()) if part)
+    if not city.strip():
+        raise OpenAthanError("Manual location needs a city in the plugin settings.")
+    params = urllib.parse.urlencode({"name": query, "count": 8, "language": "en", "format": "json"})
+    payload = request_json(f"https://geocoding-api.open-meteo.com/v1/search?{params}")
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        raise OpenAthanError(f"No location was found for {query}.")
+
+    wanted = country.strip().lower()
+    selected = results[0]
+    if wanted:
+        for result in results:
+            names = {
+                str(result.get("country") or "").lower(),
+                str(result.get("country_code") or "").lower(),
+            }
+            if wanted in names:
+                selected = result
+                break
+    return normalize_location(selected, "manual")
+
+
+def get_location(mode: str, city: str, country: str) -> dict[str, Any]:
+    ensure_dirs()
+    cached = read_json(LOCATION_CACHE)
+    wanted_source = "manual" if mode.lower() == "manual" else "auto"
+    same_requested_location = False
+    if cached and cached.get("source") == wanted_source:
+        same_requested_location = (
+            wanted_source != "manual"
+            or (
+                str(cached.get("requestedCity", "")).casefold() == city.strip().casefold()
+                and str(cached.get("requestedCountry", "")).casefold() == country.strip().casefold()
+            )
+        )
+        if same_requested_location and location_cache_fresh(cached):
+            return cached
 
     try:
-        with urllib.request.urlopen(full_url, timeout=10) as response:
-            data = json.loads(response.read().decode())
-
-            if data.get("code") == 200:
-                timings_data = data["data"]["timings"]
-                hijri_data = data["data"]["date"]["hijri"]
-
-                # Parse times into decimal hours
-                # API returns capitalized keys, map to lowercase
-                times = {}
-                prayer_key_map = {
-                    "Fajr": "fajr", "Dhuhr": "dhuhr", "Asr": "asr",
-                    "Maghrib": "maghrib", "Isha": "isha", "Sunrise": "sunrise"
-                }
-                for api_key, prayer in prayer_key_map.items():
-                    time_str = timings_data.get(api_key)
-                    if time_str and time_str != "---":
-                        # Parse "HH:MM" format
-                        parts = time_str.split(":")
-                        if len(parts) == 2:
-                            times[prayer] = int(parts[0]) + int(parts[1]) / 60.0
-
-                return {
-                    "times": times,
-                    "hijri": {
-                        "day": int(hijri_data["day"]),
-                        "month": hijri_data["month"]["en"],
-                        "month_ar": hijri_data["month"]["ar"],
-                        "year": int(hijri_data["year"]),
-                    },
-                    "date_readable": data["data"]["date"]["readable"],
-                    "timezone": data["data"]["meta"]["timezone"]
-                }
-    except Exception as e:
-        print(f"API error: {e}", file=sys.stderr)
-
-    return None
-
-# =============================================================================
-# Location Detection
-# =============================================================================
-
-def get_ip_based_location():
-    """Get location using IP-based geolocation."""
-    apis = [
-        ("https://ipapi.co/json/", lambda d: ({
-            "city": d.get("city"),
-            "country": d.get("country_name"),
-            "country_code": d.get("country_code")
-        })),
-        ("http://ip-api.com/json/?fields=status,message,country,countryCode,city,timezone", lambda d: ({
-            "city": d.get("city"),
-            "country": d.get("country"),
-            "country_code": d.get("countryCode")
-        })),
-    ]
-
-    for url, parser in apis:
-        try:
-            with urllib.request.urlopen(url, timeout=5) as response:
-                data = json.loads(response.read().decode())
-                location = parser(data)
-                if location and location.get("city"):
-                    location["timestamp"] = datetime.now().isoformat()
-                    return location
-        except Exception as e:
-            continue
-
-    # Fallback to London if nothing works
-    return {"city": "London", "country": "United Kingdom", "country_code": "GB", "timestamp": datetime.now().isoformat()}
-
-def load_location(force_refresh=False):
-    """Load location from cache or fetch new location."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not force_refresh and LOCATION_FILE.exists():
-        try:
-            with open(LOCATION_FILE, "r") as f:
-                return json.load(f)
-        except:
-            pass
-
-    location = get_ip_based_location()
-    if location:
-        with open(LOCATION_FILE, "w") as f:
-            json.dump(location, f, indent=2)
+        location = geocode_location(city, country) if wanted_source == "manual" else detect_location()
+        if wanted_source == "manual":
+            location["requestedCity"] = city.strip()
+            location["requestedCountry"] = country.strip()
+        write_json(LOCATION_CACHE, location)
         return location
+    except OpenAthanError:
+        if cached and cached.get("source") == wanted_source and same_requested_location:
+            cached["stale"] = True
+            cached["cachedAt"] = datetime.now().astimezone().isoformat()
+            write_json(LOCATION_CACHE, cached)
+            return cached
+        raise
 
-    return None
 
-def set_manual_location(city, country=None, latitude=None, longitude=None):
-    """Manually set location by city name."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+def recommended_method(country_code: str) -> str:
+    return COUNTRY_METHODS.get(country_code.upper(), "MWL")
 
-    location = {
-        "city": city,
-        "timestamp": datetime.now().isoformat(),
-        "manual": True
+
+def select_method(configured: str, country_code: str) -> tuple[str, int, bool]:
+    automatic = configured == "Auto" or configured not in METHODS
+    label = recommended_method(country_code) if automatic else configured
+    return label, METHODS[label], automatic
+
+
+def location_key(location: dict[str, Any]) -> str:
+    material = "|".join(
+        (
+            f"{float(location['latitude']):.4f}",
+            f"{float(location['longitude']):.4f}",
+            str(location.get("timezone", "")),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def parse_api_time(value: Any) -> str:
+    match = re.search(r"\b(\d{1,2}):(\d{2})\b", str(value or ""))
+    if not match:
+        raise OpenAthanError("The prayer service returned an invalid time.")
+    return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
+
+
+def fetch_timings(
+    location: dict[str, Any], method_id: int, school: str, day: date
+) -> dict[str, Any]:
+    params = urllib.parse.urlencode(
+        {
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "method": method_id,
+            "school": 1 if school == "Hanafi" else 0,
+        }
+    )
+    endpoint = f"https://api.aladhan.com/v1/timings/{day.strftime('%d-%m-%Y')}?{params}"
+    payload = request_json(endpoint)
+    if payload.get("code") != 200 or not isinstance(payload.get("data"), dict):
+        raise OpenAthanError("The prayer service could not calculate times for this location.")
+    data = payload["data"]
+    raw_timings = data.get("timings", {})
+    timings = {key: parse_api_time(raw_timings.get(api_key)) for key, _, api_key in PRAYERS}
+    hijri = data.get("date", {}).get("hijri", {})
+    month = hijri.get("month", {}) if isinstance(hijri, dict) else {}
+    timezone_name = str(data.get("meta", {}).get("timezone") or location.get("timezone") or "")
+    return {
+        "date": day.isoformat(),
+        "timings": timings,
+        "hijri": {
+            "day": str(hijri.get("day") or ""),
+            "month": str(month.get("en") or ""),
+            "year": str(hijri.get("year") or ""),
+        },
+        "timezone": timezone_name,
+        "fetchedAt": datetime.now().astimezone().isoformat(),
     }
 
-    if country:
-        location["country"] = country
+
+def get_timings(
+    location: dict[str, Any], method_id: int, school: str, day: date
+) -> dict[str, Any]:
+    ensure_dirs()
+    cache = read_json(TIMINGS_CACHE) or {}
+    key = f"{day.isoformat()}|{location_key(location)}|{method_id}|{school}"
+    records = cache.get("records", {})
+    if isinstance(records, dict) and isinstance(records.get(key), dict):
+        return records[key]
+    try:
+        result = fetch_timings(location, method_id, school, day)
+        records = records if isinstance(records, dict) else {}
+        records[key] = result
+        # At most one week of small responses is useful offline.
+        if len(records) > 7:
+            records = dict(list(records.items())[-7:])
+        write_json(TIMINGS_CACHE, {"records": records})
+        return result
+    except OpenAthanError:
+        candidates = [
+            value
+            for record_key, value in records.items()
+            if f"|{location_key(location)}|{method_id}|{school}" in record_key
+            and isinstance(value, dict)
+        ]
+        if candidates:
+            fallback = dict(candidates[-1])
+            fallback["stale"] = True
+            return fallback
+        raise
+
+
+def timezone_for(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name) if name else ZoneInfo("UTC")
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def datetime_for(day: date, clock: str, timezone: ZoneInfo) -> datetime:
+    hour, minute = (int(part) for part in clock.split(":"))
+    return datetime.combine(day, time(hour, minute), timezone)
+
+
+def duration_text(delta: timedelta, past: bool = False) -> str:
+    total_minutes = max(0, int(abs(delta.total_seconds()) // 60))
+    hours, minutes = divmod(total_minutes, 60)
+    if hours:
+        amount = f"{hours}h" + (f" {minutes}m" if minutes else "")
     else:
-        location["country"] = ""
+        amount = f"{max(1, minutes)}m"
+    return f"{amount} ago" if past else f"in {amount}"
 
-    if latitude and longitude:
-        location["latitude"] = latitude
-        location["longitude"] = longitude
 
-    with open(LOCATION_FILE, "w") as f:
-        json.dump(location, f, indent=2)
+def build_schedule(timings: dict[str, Any], now: datetime) -> tuple[list[dict[str, str]], dict[str, str]]:
+    schedule_day = date.fromisoformat(str(timings["date"]))
+    timezone = now.tzinfo or ZoneInfo("UTC")
+    prayer_moments = {
+        key: datetime_for(schedule_day, str(timings["timings"][key]), timezone)
+        for key, _, _ in PRAYERS
+    }
 
-    print(f"Location set to {city}")
-    reload_waybar()
-    return location
+    next_key = ""
+    next_moment: datetime | None = None
+    for key, _, _ in PRAYERS:
+        if key not in PRAYER_KEYS:
+            continue
+        moment = prayer_moments[key]
+        if moment > now:
+            next_key, next_moment = key, moment
+            break
+    day_label = "Today"
+    if next_moment is None:
+        next_key = "fajr"
+        next_moment = prayer_moments["fajr"]
+        while next_moment <= now:
+            next_moment += timedelta(days=1)
+        day_label = "Tomorrow" if next_moment.date() > now.date() else "Today"
 
-# =============================================================================
-# Prayer Times
-# =============================================================================
-
-def get_prayer_times_for_date(location, config):
-    """Get prayer times for today from API or cache."""
-    # Check cache first (valid for 1 hour)
-    now = datetime.now()
-    cache_valid = False
-
-    if TIMINGS_CACHE_FILE.exists():
-        try:
-            with open(TIMINGS_CACHE_FILE, "r") as f:
-                cache = json.load(f)
-                cache_time = datetime.fromisoformat(cache.get("timestamp", "2000-01-01"))
-                # Cache is valid for 4 hours
-                if (now - cache_time).total_seconds() < 4 * 3600:
-                    cache_valid = True
-                    # Check if config matches
-                    if (cache.get("method") == config["calculation_method"] and
-                        cache.get("asr_method") == config.get("asr_method", "Shafi") and
-                        cache.get("city") == location.get("city")):
-                        return cache["data"], cache.get("hijri", {})
-        except:
-            pass
-
-    if not cache_valid:
-        # Fetch from API
-        city = location.get("city", "London")
-        country = location.get("country", "United Kingdom")
-
-        result = fetch_prayer_times_from_api(
-            city, country,
-            config["calculation_method"],
-            config.get("asr_method", "Shafi")
+    rows: list[dict[str, str]] = []
+    for key, name, _ in PRAYERS:
+        moment = prayer_moments[key]
+        is_next = key == next_key and day_label == "Today"
+        rows.append(
+            {
+                "key": key,
+                "name": name,
+                "time": str(timings["timings"][key]),
+                "relative": duration_text(moment - now, past=moment <= now),
+                "status": "next" if is_next else ("past" if moment <= now else "later"),
+            }
         )
 
-        if result:
-            times = result["times"]
-            hijri = result["hijri"]
-
-            # Apply manual adjustments
-            for prayer, adj in config["adjustments"].items():
-                if prayer in times:
-                    times[prayer] += adj / 60.0
-
-            # Save to cache
-            cache_data = {
-                "timestamp": now.isoformat(),
-                "method": config["calculation_method"],
-                "asr_method": config.get("asr_method", "Shafi"),
-                "city": location.get("city"),
-                "data": times,
-                "hijri": hijri
-            }
-            with open(TIMINGS_CACHE_FILE, "w") as f:
-                json.dump(cache_data, f, indent=2)
-
-            return times, hijri
-
-    return {}, {}
-
-def get_next_prayer(times, current_time):
-    """Find the next prayer time."""
-    current_minutes = current_time.hour * 60 + current_time.minute
-
-    prayer_order = ["fajr", "dhuhr", "asr", "maghrib", "isha"]
-    for prayer in prayer_order:
-        if prayer not in times:
-            continue
-        prayer_hours = int(times[prayer])
-        prayer_minutes = int((times[prayer] - prayer_hours) * 60)
-        prayer_total_minutes = prayer_hours * 60 + prayer_minutes
-
-        if prayer_total_minutes > current_minutes:
-            time_until = prayer_total_minutes - current_minutes
-            return prayer, time_until
-
-    # Next prayer is Fajr tomorrow
-    fajr_hours = int(times["fajr"])
-    fajr_minutes = int((times["fajr"] - fajr_hours) * 60)
-    fajr_total_minutes = fajr_hours * 60 + fajr_minutes
-    time_until = (24 * 60 - current_minutes) + fajr_total_minutes
-    return "fajr", time_until
-
-def time_to_hours_minutes(decimal_hours):
-    """Convert decimal hours to hours:minutes."""
-    hours = int(decimal_hours)
-    minutes = int(round((decimal_hours - hours) * 60))
-    if minutes == 60:
-        minutes = 0
-        hours += 1
-    return f"{hours:02d}:{minutes:02d}"
-
-def format_time_until(minutes):
-    """Format time until next prayer."""
-    if minutes >= 60:
-        hours = minutes // 60
-        mins = minutes % 60
-        return f"{hours}h {mins}m"
-    return f"{minutes}m"
-
-# =============================================================================
-# Hijri Date
-# =============================================================================
-
-def format_hijri_date(hijri_data, language="en"):
-    """Format Hijri date from API data."""
-    if not hijri_data:
-        return "Unknown"
-
-    day = hijri_data.get("day", 1)
-    month = hijri_data.get("month", "Muharram") if language == "en" else hijri_data.get("month_ar", "محرم")
-    year = hijri_data.get("year", 1447)
-
-    if language == "ar":
-        return f"{day} {month} {year}"
-    return f"{day} {month} {year}"
-
-# =============================================================================
-# Configuration Management
-# =============================================================================
-
-def load_config():
-    """Load configuration from file or create default."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
-        return DEFAULT_CONFIG.copy()
-
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            config = json.load(f)
-            # Merge with defaults
-            for key, value in DEFAULT_CONFIG.items():
-                if key not in config:
-                    config[key] = value
-            return config
-    except:
-        return DEFAULT_CONFIG.copy()
-
-def save_config(config):
-    """Save configuration to file."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-
-# =============================================================================
-# State Management
-# =============================================================================
-
-def load_state():
-    """Load state from file."""
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    return {"notified_prayers": {}}
-
-def save_state(state):
-    """Save state to file."""
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-def mark_prayer_notified(date_str, prayer):
-    """Mark a prayer as notified for the day."""
-    state = load_state()
-    if date_str not in state["notified_prayers"]:
-        state["notified_prayers"][date_str] = []
-    if prayer not in state["notified_prayers"][date_str]:
-        state["notified_prayers"][date_str].append(prayer)
-        save_state(state)
-
-def was_prayer_notified(date_str, prayer):
-    """Check if a prayer was already notified."""
-    state = load_state()
-    return (date_str in state["notified_prayers"] and
-            prayer in state["notified_prayers"][date_str])
-
-def clear_timings_cache():
-    """Clear the timings cache to force API refresh."""
-    if TIMINGS_CACHE_FILE.exists():
-        TIMINGS_CACHE_FILE.unlink()
-
-# =============================================================================
-# Notifications
-# =============================================================================
-
-def send_notification(title, message, sound_file=None):
-    """Send desktop notification with optional sound."""
-    try:
-        notify_cmd = ["notify-send", "-i", "clock", title, message]
-        subprocess.run(notify_cmd, check=True)
-
-        if sound_file and Path(sound_file).exists():
-            for player in ["aplay", "paplay", "mpg123", "mpv", "ffplay"]:
-                try:
-                    if player == "mpg123":
-                        subprocess.run([player, "-q", str(sound_file)],
-                                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-                    elif player == "mpv":
-                        subprocess.run([player, "--really-quiet", "--no-video", str(sound_file)],
-                                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-                    elif player == "ffplay":
-                        subprocess.run([player, "-nodisp", "-autoexit", "-loglevel", "quiet", str(sound_file)],
-                                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-                    else:
-                        subprocess.run([player, str(sound_file)],
-                                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-                    break
-                except:
-                    continue
-    except:
-        pass
-
-# =============================================================================
-# JSON Output for Waybar
-# =============================================================================
-
-def output_waybar_json(location, config):
-    """Output JSON for Waybar custom module."""
-    local_now = datetime.now()
-    today = local_now.date()
-
-    times, hijri_data = get_prayer_times_for_date(location, config)
-
-    if not times:
-        print(json.dumps({"text": "Error", "tooltip": "Could not fetch prayer times"}))
-        return
-
-    # Find next prayer
-    next_prayer, minutes_until = get_next_prayer(times, local_now)
-
-    mosque_icon = ""
-    names = PRAYER_NAMES[config.get("language", "en")]
-    next_prayer_name = names[next_prayer]
-
-    # Build tooltip
-    lines = []
-    lines.append(f"Next: {next_prayer_name} in {format_time_until(minutes_until)}")
-    lines.append("")
-
-    if config.get("show_hijri_date", True) and hijri_data:
-        lines.append(f"📅 {format_hijri_date(hijri_data, config.get('language', 'en'))}")
-        lines.append("")
-
-    lines.append("Today's Prayer Times:")
-    for prayer in ["fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha"]:
-        if prayer in times:
-            prayer_name = names[prayer]
-            time_str = time_to_hours_minutes(times[prayer])
-            is_next = prayer == next_prayer
-            prefix = "  " if not is_next else ""
-            lines.append(f"{prefix}{prayer_name}: {time_str}")
-
-    loc_city = location.get('city', 'Unknown')
-    loc_country = location.get('country', 'Unknown')
-    location_info = f"\nLocation: {loc_city}, {loc_country}"
-    method_info = f"Method: {config['calculation_method']}"
-
-    tooltip = "\n".join(lines) + location_info + "\n" + method_info
-
-    output = {
-        "text": f"{mosque_icon} {next_prayer_name} - {format_time_until(minutes_until)}",
-        "tooltip": tooltip,
-        "class": "next-prayer",
-        "alt": next_prayer
+    next_name = next(name for key, name, _ in PRAYERS if key == next_key)
+    return rows, {
+        "key": next_key,
+        "name": next_name,
+        "time": next_moment.strftime("%H:%M"),
+        "countdown": duration_text(next_moment - now),
+        "dayLabel": day_label,
     }
 
-    print(json.dumps(output))
 
-# =============================================================================
-# Daemon Mode
-# =============================================================================
-
-daemon_running = True
-
-def check_prayer_times(location, config):
-    """Check if it's time for prayer and send notification."""
-    local_now = datetime.now()
-    date_str = local_now.strftime("%Y-%m-%d")
-
-    times, _ = get_prayer_times_for_date(location, config)
-    current_minutes = local_now.hour * 60 + local_now.minute
-
-    names = PRAYER_NAMES[config.get("language", "en")]
-
-    for prayer in ["fajr", "dhuhr", "asr", "maghrib", "isha"]:
-        if prayer not in times:
-            continue
-
-        prayer_hours = int(times[prayer])
-        prayer_minutes = int((times[prayer] - prayer_hours) * 60)
-        prayer_total_minutes = prayer_hours * 60 + prayer_minutes
-
-        if abs(current_minutes - prayer_total_minutes) <= 1:
-            if not was_prayer_notified(date_str, prayer):
-                mark_prayer_notified(date_str, prayer)
-
-                if config.get("notifications_enabled", True):
-                    time_str = time_to_hours_minutes(times[prayer])
-                    title = f"Prayer Time: {names[prayer]}"
-                    message = f"It is time for {names[prayer]} prayer at {time_str}"
-
-                    sound = config.get("sound_enabled", False)
-                    sound_file = config["notification_sound"] if sound else None
-                    send_notification(title, message, sound_file)
-
-def daemon_main(location, config):
-    """Main daemon loop."""
-    global daemon_running
-    while daemon_running:
-        check_prayer_times(location, config)
-        time.sleep(30)
-
-def run_daemon(location, config):
-    """Run daemon in background."""
-    pid_file = CONFIG_DIR / "openathan.pid"
-
-    if pid_file.exists():
-        try:
-            with open(pid_file, "r") as f:
-                pid = int(f.read().strip())
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                pass
-        except:
-            pass
-
-    pid = os.fork()
-    if pid > 0:
-        with open(pid_file, "w") as f:
-            f.write(str(pid))
-        print(f"Started daemon with PID {pid}")
-        return
-    else:
-        os.setsid()
-        os.umask(0)
-        with open(os.devnull, 'r') as f_in:
-            os.dup2(f_in.fileno(), 0)
-            os.dup2(f_in.fileno(), 1)
-            os.dup2(f_in.fileno(), 2)
-        daemon_main(location, config)
-
-def stop_daemon():
-    """Stop running daemon."""
-    pid_file = CONFIG_DIR / "openathan.pid"
-
-    if not pid_file.exists():
-        print("Daemon is not running")
-        return
-
+def theme_color() -> str:
     try:
-        with open(pid_file, "r") as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 15)
-        pid_file.unlink()
-        print(f"Stopped daemon (PID {pid})")
-    except Exception as e:
-        print(f"Error stopping daemon: {e}")
+        colors = THEME_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return "#c9c7cd"
+    for key in ("accent", "foreground", "color7"):
+        match = re.search(rf"^\s*{key}\s*=\s*[\"']?(#[0-9a-fA-F]{{6}})", colors, re.MULTILINE)
+        if match:
+            return match.group(1).lower()
+    return "#c9c7cd"
 
-# =============================================================================
-# Waybar Management
-# =============================================================================
 
-def reload_waybar():
-    """Reload waybar to apply changes."""
+def render_themed_icon() -> Path:
+    ensure_dirs()
+    source = (PLUGIN_DIR / "assets/openathan.svg").read_text(encoding="utf-8")
+    rendered = source.replace("currentColor", theme_color())
     try:
-        subprocess.run(["killall", "waybar"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        subprocess.Popen(["waybar"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    except:
+        if THEMED_ICON.read_text(encoding="utf-8") == rendered:
+            return THEMED_ICON
+    except OSError:
         pass
+    THEMED_ICON.write_text(rendered, encoding="utf-8")
+    return THEMED_ICON
 
-# =============================================================================
-# CLI Interface
-# =============================================================================
 
-def main():
-    parser = argparse.ArgumentParser(description="OpenAthan - Islamic Prayer Times for Waybar")
-    parser.add_argument("--refresh", action="store_true",
-                        help="Force refresh waybar module immediately")
-    parser.add_argument("--refresh-location", action="store_true",
-                        help="Refresh location from IP geolocation")
-    parser.add_argument("--set-location", nargs="+", metavar="CITY [COUNTRY]",
-                        help="Manually set location by city (e.g., --set-location \"Birmingham\" \"UK\")")
-    parser.add_argument("--daemon", action="store_true",
-                        help="Run notification daemon in background")
-    parser.add_argument("--stop-daemon", action="store_true",
-                        help="Stop notification daemon")
-    parser.add_argument("--set-method", metavar="METHOD",
-                        choices=list(ALADHAN_METHODS.keys()),
-                        help="Set calculation method")
-    parser.add_argument("--set-asr", metavar="METHOD",
-                        choices=["Shafi", "Hanafi"],
-                        help="Set Asr calculation method (Shafi or Hanafi)")
-    parser.add_argument("--toggle-notifications", action="store_true",
-                        help="Toggle prayer time notifications")
-    parser.add_argument("--toggle-sound", action="store_true",
-                        help="Toggle notification sound")
-    parser.add_argument("--adjust", nargs=2, metavar=("PRAYER", "MINUTES"),
-                        help="Adjust prayer time by minutes (e.g., --adjust maghrib 2)")
-    parser.add_argument("--list-methods", action="store_true",
-                        help="List available calculation methods")
+def send_notification_if_due(
+    schedule: list[dict[str, str]], location: dict[str, Any], now: datetime, icon_path: Path
+) -> None:
+    state = read_json(NOTIFICATION_STATE) or {"sent": {}}
+    sent = state.get("sent", {})
+    sent = sent if isinstance(sent, dict) else {}
+    today_key = now.date().isoformat()
+    today_sent = sent.get(today_key, [])
+    today_sent = today_sent if isinstance(today_sent, list) else []
 
-    args = parser.parse_args()
+    for prayer in schedule:
+        if prayer["key"] not in PRAYER_KEYS or prayer["key"] in today_sent:
+            continue
+        prayer_time = datetime_for(now.date(), prayer["time"], now.tzinfo or ZoneInfo("UTC"))
+        if timedelta(0) <= now - prayer_time < timedelta(minutes=2):
+            city = str(location.get("city") or "your location")
+            command = [
+                "notify-send",
+                "--app-name=OpenAthan",
+                f"--icon={icon_path}",
+                f"Prayer time · {prayer['name']}",
+                f"{prayer['name']} begins now at {prayer['time']} in {city}.",
+            ]
+            try:
+                subprocess.run(command, check=False, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                return
+            today_sent.append(prayer["key"])
+            sent = {today_key: today_sent}
+            write_json(NOTIFICATION_STATE, {"sent": sent})
+            return
 
-    # Handle special commands
-    if args.list_methods:
-        print("Available calculation methods:")
-        for name, method_id in ALADHAN_METHODS.items():
-            print(f"  {name}")
-        return
 
-    if args.set_location:
-        parts = args.set_location
-        city = parts[0]
-        country = parts[1] if len(parts) > 1 else None
-        set_manual_location(city, country)
-        clear_timings_cache()  # Force refresh with new location
-        return
+def format_hijri(value: dict[str, Any]) -> str:
+    parts = (str(value.get("day", "")), str(value.get("month", "")), str(value.get("year", "")))
+    return " ".join(part for part in parts if part)
 
-    if args.stop_daemon:
-        stop_daemon()
-        return
 
-    # Load config and location
-    config = load_config()
-    location = load_location(force_refresh=args.refresh_location)
+def build_report(args: argparse.Namespace) -> dict[str, Any]:
+    location = get_location(args.location_mode, args.city, args.country)
+    method_label, method_id, method_auto = select_method(args.method, str(location.get("countryCode", "")))
 
-    if not location:
-        print("Error: Could not determine location", file=sys.stderr)
-        sys.exit(1)
+    # The API timezone is authoritative; the location provider is a fallback for the first request.
+    initial_timezone = timezone_for(str(location.get("timezone", "")))
+    initial_now = datetime.now(initial_timezone)
+    timings = get_timings(location, method_id, args.school, initial_now.date())
+    timezone = timezone_for(str(timings.get("timezone", "")))
+    now = datetime.now(timezone)
+    if date.fromisoformat(str(timings["date"])) != now.date():
+        timings = get_timings(location, method_id, args.school, now.date())
 
-    # Handle configuration changes
-    config_changed = False
+    schedule, next_prayer = build_schedule(timings, now)
+    icon_path = render_themed_icon()
+    if args.notify and not timings.get("stale", False):
+        send_notification_if_due(schedule, location, now, icon_path)
 
-    if args.set_method:
-        config["calculation_method"] = args.set_method
-        config_changed = True
-        clear_timings_cache()  # Force refresh with new method
+    country = str(location.get("country") or "").strip()
+    city = str(location.get("city") or "Unknown city").strip()
+    return {
+        "ok": True,
+        "generatedAt": now.isoformat(),
+        "iconPath": str(icon_path),
+        "location": {
+            "city": city,
+            "country": country,
+            "label": f"{city}, {country}" if country else city,
+            "source": location.get("source", "auto"),
+            "stale": bool(location.get("stale", False)),
+        },
+        "method": {"label": method_label, "automatic": method_auto},
+        "school": args.school,
+        "hijri": format_hijri(timings.get("hijri", {})),
+        "stale": bool(timings.get("stale", False)),
+        "next": next_prayer,
+        "prayers": schedule,
+    }
 
-    if args.set_asr:
-        config["asr_method"] = args.set_asr
-        config_changed = True
-        clear_timings_cache()  # Force refresh with new method
 
-    if args.toggle_notifications:
-        config["notifications_enabled"] = not config.get("notifications_enabled", True)
-        status = "enabled" if config["notifications_enabled"] else "disabled"
-        print(f"Notifications {status}")
-        config_changed = True
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="OpenAthan prayer data service")
+    parser.add_argument("--location-mode", choices=("auto", "manual"), default="auto")
+    parser.add_argument("--city", default="")
+    parser.add_argument("--country", default="")
+    parser.add_argument("--method", choices=("Auto", *METHODS.keys()), default="Auto")
+    parser.add_argument("--school", choices=("Shafi", "Hanafi"), default="Shafi")
+    parser.add_argument("--notify", action="store_true")
+    return parser.parse_args(argv)
 
-    if args.toggle_sound:
-        config["sound_enabled"] = not config.get("sound_enabled", True)
-        status = "enabled" if config["sound_enabled"] else "disabled"
-        print(f"Sound {status}")
-        config_changed = True
 
-    if args.adjust:
-        prayer, minutes = args.adjust
-        try:
-            minutes = int(minutes)
-            if prayer in config["adjustments"]:
-                config["adjustments"][prayer] = minutes
-                config_changed = True
-                print(f"{prayer.capitalize()} adjusted by {minutes} minutes")
-                clear_timings_cache()
-            else:
-                print(f"Invalid prayer name: {prayer}")
-        except ValueError:
-            print("Minutes must be a number")
+def main(argv: list[str] | None = None) -> int:
+    try:
+        report = build_report(parse_args(argv))
+        print(json.dumps(report, ensure_ascii=True, separators=(",", ":")))
+        return 0
+    except OpenAthanError as error:
+        print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=True))
+        return 1
+    except Exception as error:  # Keep the shell alive if an unexpected provider shape lands.
+        print(json.dumps({"ok": False, "error": f"OpenAthan failed: {error}"}, ensure_ascii=True))
+        return 1
 
-    if config_changed:
-        save_config(config)
-        reload_waybar()
-
-    if args.refresh_location:
-        clear_timings_cache()
-
-    # Handle daemon mode
-    if args.daemon:
-        run_daemon(location, config)
-        return
-
-    # Default: output JSON for Waybar
-    output_waybar_json(location, config)
 
 if __name__ == "__main__":
-    import urllib.parse
-    main()
+    sys.exit(main())

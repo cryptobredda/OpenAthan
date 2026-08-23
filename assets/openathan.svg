@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="OpenAthan">
+  <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="4">
+    <path d="M12 54h40"/>
+    <path d="M18 54V31c0-9 6-16 14-21 8 5 14 12 14 21v23"/>
+    <path d="M26 54V39a6 6 0 0 1 12 0v15"/>
+    <path d="M32 10V5"/>
+    <path d="M42 20a9 9 0 1 1-8-8 7 7 0 0 0 8 8Z" stroke-width="3"/>
+  </g>
+</svg>
