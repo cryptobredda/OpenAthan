@@ -8,9 +8,10 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -108,6 +109,9 @@ class OpenAthanError(RuntimeError):
 def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for path in (STATE_DIR, CACHE_DIR):
+        directory_fd = open_directory(path)
+        os.close(directory_fd)
 
 
 def read_limited(stream: Any, max_bytes: int) -> bytes:
@@ -123,9 +127,65 @@ def read_limited(stream: Any, max_bytes: int) -> bytes:
         chunks.append(chunk)
 
 
+def open_directory(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(path, flags)
+    try:
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise OpenAthanError("A local data directory is not a safe user-owned directory.")
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
 def read_text_limited(path: Path, max_bytes: int) -> str:
-    with path.open("rb") as stream:
-        return read_limited(stream, max_bytes).decode("utf-8")
+    directory_fd = open_directory(path.parent)
+    file_fd = -1
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        file_fd = os.open(path.name, flags, dir_fd=directory_fd)
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise OpenAthanError("A local data file is not a safe user-owned regular file.")
+        if metadata.st_size > max_bytes:
+            raise OpenAthanError("Input exceeded the allowed size.")
+        with os.fdopen(file_fd, "rb") as stream:
+            file_fd = -1
+            return read_limited(stream, max_bytes).decode("utf-8")
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(directory_fd)
+
+
+def atomic_write_text(path: Path, value: str, max_bytes: int) -> None:
+    payload = value.encode("utf-8")
+    if len(payload) > max_bytes:
+        raise OpenAthanError("Output exceeded the allowed size.")
+
+    directory_fd = open_directory(path.parent)
+    temporary = f".{path.name}.{secrets.token_hex(8)}"
+    file_fd = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        file_fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        with os.fdopen(file_fd, "wb") as stream:
+            file_fd = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
 
 
 def validate_json_shape(value: Any) -> None:
@@ -168,17 +228,8 @@ def read_json(path: Path) -> dict[str, Any] | None:
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, ensure_ascii=True, indent=2)
-            stream.write("\n")
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+    rendered = json.dumps(value, ensure_ascii=True, indent=2) + "\n"
+    atomic_write_text(path, rendered, CACHE_MAX_BYTES)
 
 
 def request_json(url: str, timeout: float = 8) -> dict[str, Any]:
@@ -541,7 +592,7 @@ def render_themed_icon() -> Path:
             return THEMED_ICON
     except (OSError, UnicodeError, OpenAthanError):
         pass
-    THEMED_ICON.write_text(rendered, encoding="utf-8")
+    atomic_write_text(THEMED_ICON, rendered, SVG_MAX_BYTES)
     return THEMED_ICON
 
 

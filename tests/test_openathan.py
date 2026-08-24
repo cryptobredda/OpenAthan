@@ -26,6 +26,50 @@ class OpenAthanTests(unittest.TestCase):
             path.write_bytes(b" " * (openathan.CACHE_MAX_BYTES + 1))
             self.assertIsNone(openathan.read_json(path))
 
+    def test_limited_file_reader_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.txt"
+            link = root / "link.txt"
+            target.write_text("private", encoding="utf-8")
+            link.symlink_to(target)
+            with self.assertRaises(OSError):
+                openathan.read_text_limited(link, 32)
+
+    def test_limited_file_reader_rejects_special_file_without_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = Path(directory) / "input.fifo"
+            fifo.parent.chmod(0o700)
+            openathan.os.mkfifo(fifo)
+            with self.assertRaises(openathan.OpenAthanError):
+                openathan.read_text_limited(fifo, 32)
+
+    def test_atomic_write_replaces_symlink_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            target = root / "target.txt"
+            output = root / "output.txt"
+            target.write_text("unchanged", encoding="utf-8")
+            output.symlink_to(target)
+
+            openathan.atomic_write_text(output, "generated", 32)
+
+            self.assertFalse(output.is_symlink())
+            self.assertEqual(output.read_text(encoding="utf-8"), "generated")
+            self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+
+    def test_file_access_rejects_symlinked_parent_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "real"
+            link = root / "link"
+            real.mkdir()
+            link.symlink_to(real, target_is_directory=True)
+            (real / "data.txt").write_text("value", encoding="utf-8")
+            with self.assertRaises(OSError):
+                openathan.read_text_limited(link / "data.txt", 32)
+
     def test_json_shape_rejects_excessive_entries(self):
         value = list(range(openathan.JSON_MAX_CONTAINER_ITEMS + 1))
         with self.assertRaises(openathan.OpenAthanError):
