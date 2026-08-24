@@ -22,8 +22,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 PLUGIN_DIR = Path(__file__).resolve().parent
-STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "openathan"
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "openathan"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "openathan"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "openathan"
 LOCATION_CACHE = STATE_DIR / "location.json"
 TIMINGS_CACHE = CACHE_DIR / "timings.json"
 NOTIFICATION_STATE = STATE_DIR / "notifications.json"

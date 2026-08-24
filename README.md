@@ -57,10 +57,12 @@ Remove the plugin and its cached location, prayer schedule, and generated icon w
 
 ```bash
 omarchy plugin remove bredda.openathan
-rm -rf ~/.local/state/openathan ~/.cache/openathan
+state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
+cache_home=${XDG_CACHE_HOME:-"$HOME/.cache"}
+rm -rf -- "$state_home/openathan" "$cache_home/openathan"
 ```
 
-Removing the plugin does not alter other Omarchy or Hyprland configuration.
+This resolves the same XDG state and cache directories used by OpenAthan. Removing the plugin does not alter other Omarchy or Hyprland configuration.
 
 ## Use
 
